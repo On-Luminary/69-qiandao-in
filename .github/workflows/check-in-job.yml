@@ -8,6 +8,8 @@ on:
 jobs:
   checkin:
     runs-on: ubuntu-latest
+    env:
+      CTO_NEW_API_KEY: ${{ secrets.CTO_NEW_API_KEY }}
     
     steps:
     - name: Checkout repository
@@ -22,6 +24,12 @@ jobs:
       run: |
         npm install
         npm install node-fetch
+
+    - name: Validate CTO_NEW_API_KEY availability
+      if: env.CTO_NEW_API_KEY != ''
+      run: |
+        [ -n "$CTO_NEW_API_KEY" ] || exit 1
+        echo "CTO_NEW_API_KEY is available"
 
     - name: Run scheduled check-in
       run: |
