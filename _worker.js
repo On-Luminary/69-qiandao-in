@@ -4,10 +4,9 @@ let password = "Enter your password here";
 let token; 
 let botToken = '';  
 let chatId = '';  
-let pushplusToken = '';  // 新增 Pushplus token
+let pushplusToken = '';  
 let checkInResult;
 let jcType = '69yun69';  
- // 初始化变量
 let fetch, Response; 
 
 // 判断当前环境是否是 Node.js 环境
@@ -24,9 +23,8 @@ if (typeof globalThis.fetch === "undefined") {
         TOKEN: process.env.TOKEN,
         TG_TOKEN: process.env.TG_TOKEN,
         TG_ID: process.env.TG_ID,
-        PUSHPLUS_TOKEN: process.env.PUSHPLUS_TOKEN  // 新增 Pushplus token
+        PUSHPLUS_TOKEN: process.env.PUSHPLUS_TOKEN
     };
-   //console.log("在 Node.js 环境中env",env);
 
     const handler = {
         async scheduled(controller, env) {
@@ -56,7 +54,6 @@ if (typeof globalThis.fetch === "undefined") {
   Response = globalThis.Response;
   console.log("在 Cloudflare Worker 环境中，已使用内置 fetch");
 }
-
 
 export default {
     async fetch(request, env) {
@@ -101,13 +98,21 @@ function decodeBase64Utf8(b64) {
 async function handleCheckIn() {
     try {
         validateConfig();
+        let checkInMsg = '';
+        let trafficInfo = '';
+        
         if (jcType === "hongxingdl") {
-          checkInResult = await hongxingdlCheckIn();
+          checkInMsg = await hongxingdlCheckIn();
         } else {
           const cookies = await loginAndGetCookies();
-          checkInResult = await performCheckIn(cookies);
+          checkInMsg = await performCheckIn(cookies);
+          // 新增：获取流量信息
+          trafficInfo = await getTrafficInfo(cookies);
         }
  
+        // 合并签到结果和流量信息
+        checkInResult = `${checkInMsg}\n\n📊 流量使用情况:\n${trafficInfo}`;
+
         // 同时发送 Telegram 和 Pushplus 消息
         await Promise.allSettled([
             sendMessage(checkInResult),
@@ -117,15 +122,172 @@ async function handleCheckIn() {
         return new Response(checkInResult, { status: 200 });
     } catch (error) {
         console.error("签到失败:", error);
-        const errorMsg = `${checkInResult}\n🎁🎁${error.message}`;
+        const errorMsg = `${checkInResult || '签到失败'}\n🎁🎁${error.message}`;
         
-        // 同时发送错误消息到两个平台
         await Promise.allSettled([
             sendMessage(errorMsg),
             sendPushplusMessage(errorMsg)
         ]);
         
         return new Response(errorMsg, { status: 500 });
+    }
+}
+
+// 新增：获取流量信息函数
+async function getTrafficInfo(cookies) {
+    try {
+        // 尝试从用户面板获取流量信息
+        const userPanelUrl = `${domain}/user`;
+        const response = await fetch(userPanelUrl, {
+            method: "GET",
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
+                'Cookie': cookies,
+                'Referer': `${domain}/user`
+            },
+        });
+
+        if (!response.ok) {
+            throw new Error(`获取流量信息失败: ${response.status}`);
+        }
+
+        const html = await response.text();
+        console.log("获取用户页面成功，开始解析流量信息...");
+        
+        // 解析HTML获取流量信息
+        return parseTrafficFromHtml(html);
+        
+    } catch (error) {
+        console.error("获取流量信息失败:", error);
+        return `❌ 无法获取流量信息: ${error.message}`;
+    }
+}
+
+// 新增：从HTML解析流量信息
+function parseTrafficFromHtml(html) {
+    try {
+        console.log("开始解析HTML内容...");
+        
+        // 方法1：尝试匹配流量使用情况的数字模式
+        const trafficPatterns = [
+            // 匹配类似 "128.45 GB / 500.00 GB" 的模式
+            /([\d.]+)\s*([GMK]B)\s*\/\s*([\d.]+)\s*([GMK]B)/gi,
+            // 匹配已用流量和总流量分开的模式
+            /已用[^：:]*[：:]\s*([\d.]+)\s*([GMK]B)/gi,
+            /总流量[^：:]*[：:]\s*([\d.]+)\s*([GMK]B)/gi,
+            /剩余[^：:]*[：:]\s*([\d.]+)\s*([GMK]B)/gi,
+            // 匹配数字+单位模式
+            /(\d+(?:\.\d+)?)\s*(GB|MB|KB|TB)/gi
+        ];
+
+        let usedTraffic = null;
+        let totalTraffic = null;
+        let remainingTraffic = null;
+
+        // 尝试多种匹配模式
+        for (const pattern of trafficPatterns) {
+            const matches = html.matchAll(pattern);
+            for (const match of matches) {
+                const value = parseFloat(match[1]);
+                const unit = match[2];
+                
+                // 根据上下文判断流量类型
+                const context = html.substring(Math.max(0, match.index - 50), match.index + 50);
+                
+                if (context.includes('已用') || context.includes('used') || context.includes('使用')) {
+                    usedTraffic = { value, unit };
+                } else if (context.includes('总流量') || context.includes('total') || context.includes('全部')) {
+                    totalTraffic = { value, unit };
+                } else if (context.includes('剩余') || context.includes('remaining') || context.includes('剩余')) {
+                    remainingTraffic = { value, unit };
+                } else if (!usedTraffic) {
+                    usedTraffic = { value, unit };
+                } else if (!totalTraffic) {
+                    totalTraffic = { value, unit };
+                }
+            }
+        }
+
+        // 如果找到了流量信息，构建结果
+        if (usedTraffic || totalTraffic) {
+            let result = '';
+            
+            if (usedTraffic) {
+                result += `📥 已用流量: ${usedTraffic.value} ${usedTraffic.unit}\n`;
+            }
+            
+            if (totalTraffic) {
+                result += `📊 总流量: ${totalTraffic.value} ${totalTraffic.unit}\n`;
+            }
+            
+            if (remainingTraffic) {
+                result += `📤 剩余流量: ${remainingTraffic.value} ${remainingTraffic.unit}\n`;
+            } else if (usedTraffic && totalTraffic) {
+                // 计算剩余流量
+                const usedGB = convertToGB(usedTraffic.value, usedTraffic.unit);
+                const totalGB = convertToGB(totalTraffic.value, totalTraffic.unit);
+                const remainingGB = totalGB - usedGB;
+                
+                if (remainingGB > 0) {
+                    result += `📤 剩余流量: ${formatTraffic(remainingGB)}\n`;
+                }
+            }
+            
+            // 计算使用百分比
+            if (usedTraffic && totalTraffic) {
+                const usedGB = convertToGB(usedTraffic.value, usedTraffic.unit);
+                const totalGB = convertToGB(totalTraffic.value, totalTraffic.unit);
+                
+                if (totalGB > 0) {
+                    const percentage = ((usedGB / totalGB) * 100).toFixed(1);
+                    result += `📈 使用比例: ${percentage}%`;
+                    
+                    // 添加使用情况提示
+                    if (percentage > 90) {
+                        result += ' ⚠️ 流量即将用完';
+                    } else if (percentage > 70) {
+                        result += ' 🔔 流量使用较多';
+                    } else if (percentage < 30) {
+                        result += ' ✅ 流量充足';
+                    }
+                }
+            }
+            
+            return result || '⚠️ 找到流量数据但格式不匹配';
+        } else {
+            // 备用方案：查找包含流量关键词的区域
+            const trafficSection = html.match(/<div[^>]*>(.*?(流量|Traffic).*?)<\/div>/gi);
+            if (trafficSection) {
+                return `🔍 检测到流量区域但无法解析，请检查页面结构`;
+            }
+            return '⚠️ 未找到流量信息，可能是页面结构变化';
+        }
+        
+    } catch (error) {
+        console.error("解析流量信息时出错:", error);
+        return `❌ 解析流量信息失败: ${error.message}`;
+    }
+}
+
+// 新增：转换流量单位为GB
+function convertToGB(value, unit) {
+    switch (unit.toUpperCase()) {
+        case 'TB': return value * 1024;
+        case 'GB': return value;
+        case 'MB': return value / 1024;
+        case 'KB': return value / (1024 * 1024);
+        default: return value;
+    }
+}
+
+// 新增：格式化流量显示
+function formatTraffic(gbValue) {
+    if (gbValue >= 1024) {
+        return `${(gbValue / 1024).toFixed(2)} TB`;
+    } else if (gbValue >= 1) {
+        return `${gbValue.toFixed(2)} GB`;
+    } else {
+        return `${(gbValue * 1024).toFixed(2)} MB`;
     }
 }
 
@@ -226,7 +388,6 @@ async function hongxingdlCheckIn() {
     return `🎉🎉 ${jcType}签到结果 🎉🎉🎉\n${jsonResponse.data?.mag ?? "签到完成"}${str}`;
 }
 
-
 const jcButtons = {
     "69yun69": [
         [
@@ -245,7 +406,6 @@ const jcButtons = {
         ]
     ]
 };
-
 
 async function sendMessage(msg) {
     if (!botToken || !chatId) {
@@ -350,7 +510,6 @@ async function handleTgMsg() {
     return new Response(sendResult, { status: 200 });
 }
 
-
 function maskSensitiveData(str, type = 'default') {
     if (!str) return "N/A";
 
@@ -375,7 +534,7 @@ async function initConfig(env) {
     botToken = env.TG_TOKEN || botToken;  
     chatId = env.TG_ID || chatId; 
     jcType = env.JC_TYPE || jcType; 
-    pushplusToken = env.PUSHPLUS_TOKEN || pushplusToken; // 新增 Pushplus token
+    pushplusToken = env.PUSHPLUS_TOKEN || pushplusToken;
     
     checkInResult = `配置信息: 
     机场类型: ${jcType} 
@@ -383,7 +542,5 @@ async function initConfig(env) {
     登录账号: ${maskSensitiveData(username, 'email')} 
     登录密码: ${maskSensitiveData(password)} 
     TG 推送:  ${botToken && chatId ? "已启用" : "未启用"} 
-    Pushplus 推送: ${pushplusToken ? "已启用" : "未启用"}`; // 新增 Pushplus 状态
- 
-    //console.log("initConfig-->", checkInResult);
+    Pushplus 推送: ${pushplusToken ? "已启用" : "未启用"}`;
 }
